@@ -132,7 +132,49 @@ def normalize_lat_lon(lat, lon, lon_mode=None):
 			lon = normalize_lon_to_mode(lon + 180, lon_mode) if lon_mode is not None else mod_longitude(lon + 180)
 	return lat, lon
 
-	
+
+def midpoint_on_sphere(lat1, lon1, lat2, lon2, lon_mode=None):
+	"""Return the spherical midpoint between two latitude/longitude pairs."""
+	lat1_rad = np.deg2rad(lat1)
+	lon1_rad = np.deg2rad(lon1)
+	lat2_rad = np.deg2rad(lat2)
+	lon2_rad = np.deg2rad(lon2)
+
+	# Convert to 3D unit vectors
+	x1 = np.cos(lat1_rad) * np.cos(lon1_rad)
+	y1 = np.cos(lat1_rad) * np.sin(lon1_rad)
+	z1 = np.sin(lat1_rad)
+	x2 = np.cos(lat2_rad) * np.cos(lon2_rad)
+	y2 = np.cos(lat2_rad) * np.sin(lon2_rad)
+	z2 = np.sin(lat2_rad)
+
+	sum_vec = np.array([x1 + x2, y1 + y2, z1 + z2], dtype=np.float64)
+	norm = np.linalg.norm(sum_vec)
+
+	if norm < 1e-12:
+		# Points are nearly antipodal; fall back to simple averaging.
+		delta_lon = mod_longitude(lon2 - lon1)
+		mid_lon = lon1 + 0.5 * delta_lon
+		mid_lat = 0.5 * (lat1 + lat2)
+	else:
+		unit = sum_vec / norm
+		mid_lat = np.rad2deg(np.arcsin(np.clip(unit[2], -1.0, 1.0)))
+		mid_lon = np.rad2deg(np.arctan2(unit[1], unit[0]))
+
+	if lon_mode is None:
+		mid_lon = mod_longitude(mid_lon)
+	else:
+		mid_lon = normalize_lon_to_mode(mid_lon, lon_mode)
+
+	# Ensure latitude stays within valid bounds (handle tiny numerical drift)
+	if mid_lat > 90.0:
+		mid_lat = 90.0
+	elif mid_lat < -90.0:
+		mid_lat = -90.0
+
+	return mid_lat, mid_lon
+
+
 def calculate_longitude_offset(latitude_deg, distance_m, radius):
 	R = radius
 	latitude_rad = np.deg2rad(latitude_deg)
@@ -175,27 +217,71 @@ def normalize_lon_to_mode(lon, mode):
 
 def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, lat_grid, lon_grid, lon_mode=None):
 	"""Helper function to get interpolated winds at a point"""
+	alt_grid = np.asarray(alt_grid)
+	lat_grid = np.asarray(lat_grid)
+	lon_grid = np.asarray(lon_grid, dtype=np.float64)
+	u_field = np.asarray(u_field)
+	v_field = np.asarray(v_field)
+	w_field = np.asarray(w_field)
+
+	periodic = False
+	lon_ext = lon_grid
+	u_ext = u_field
+	v_ext = v_field
+	w_ext = w_field
+
+	if lon_grid.ndim == 1 and lon_grid.size >= 2 and np.all(np.diff(lon_grid) > 0):
+		diff = np.diff(lon_grid)
+		step = float(np.min(diff))
+		if step > 0.0 and np.isfinite(step):
+			span = float(lon_grid[-1] - lon_grid[0])
+			if np.isfinite(span):
+				full_span = span + step
+				wrap = 360.0
+				if np.isclose(full_span % wrap, 0.0, atol=1e-6) or np.isclose(full_span, wrap, atol=1e-6):
+					wrap_value = lon_grid[0] + wrap
+					if wrap_value <= lon_grid[-1] + 1e-6:
+						wrap_value = lon_grid[-1] + step
+					lon_ext = np.concatenate([lon_grid, [wrap_value]])
+					u_ext = np.concatenate([u_field, u_field[..., :1]], axis=-1)
+					v_ext = np.concatenate([v_field, v_field[..., :1]], axis=-1)
+					w_ext = np.concatenate([w_field, w_field[..., :1]], axis=-1)
+					periodic = True
+
 	if lon_mode is not None:
 		lon = normalize_lon_to_mode(lon, lon_mode)
+	else:
+		lon = mod_longitude(lon)
+
+	if periodic:
+		span = lon_ext[-1] - lon_ext[0]
+		if span > 0.0 and np.isfinite(span):
+			lon = ((lon - lon_ext[0]) % span) + lon_ext[0]
+			# allow exact upper bound for the duplicated column
+			if lon > lon_ext[-1]:
+				lon = lon_ext[-1]
+	else:
+		lon = float(np.clip(lon, lon_ext[0], lon_ext[-1]))
+
 	interp_point = np.array([[alt, lat, lon]], dtype=np.float64)
 
 	u_interp = RegularGridInterpolator(
-		(alt_grid, lat_grid, lon_grid),
-		u_field,
+		(alt_grid, lat_grid, lon_ext),
+		u_ext,
 		method='linear',
 		bounds_error=False,
 		fill_value=np.nan
 	)
 	v_interp = RegularGridInterpolator(
-		(alt_grid, lat_grid, lon_grid),
-		v_field,
+		(alt_grid, lat_grid, lon_ext),
+		v_ext,
 		method='linear',
 		bounds_error=False,
 		fill_value=np.nan
 	)
 	w_interp = RegularGridInterpolator(
-		(alt_grid, lat_grid, lon_grid),
-		w_field,
+		(alt_grid, lat_grid, lon_ext),
+		w_ext,
 		method='linear',
 		bounds_error=False,
 		fill_value=np.nan
@@ -209,26 +295,171 @@ def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, l
 
 def get_next_position_alt(lon, lat, alt_m, wind, dt, radius, lower_boundary, upper_boundary, lon_mode=None, w_positive_up=True):
 	"""Propagate a particle in space using altitude (m) as vertical coordinate."""
-	dx = wind[0] * dt
-	dy = wind[1] * dt
+	if not np.isfinite(dt) or dt == 0.0:
+		return (lon, lat, alt_m)
+
+	lon_rad = np.deg2rad(lon)
+	lat_rad = np.deg2rad(lat)
+	if not np.isfinite(lon_rad) or not np.isfinite(lat_rad):
+		return None
+
+	cos_lat = np.cos(lat_rad)
+	min_abs_cos = 1e-6
+	if not np.isfinite(cos_lat):
+		return None
+	if cos_lat >= 0:
+		cos_lat = max(cos_lat, min_abs_cos)
+	else:
+		cos_lat = min(cos_lat, -min_abs_cos)
+
+	lon_rate = wind[0] / (radius * cos_lat)
+	lat_rate = wind[1] / radius
 	dz = wind[2] * dt if w_positive_up else -wind[2] * dt
 
-	lon_offset = calculate_longitude_offset(lat, dx, radius)
-	lat_offset = calculate_latitude_offset(dy, radius)
-	if not np.isfinite(lon_offset) or not np.isfinite(lat_offset) or not np.isfinite(dz):
+	if not np.isfinite(lon_rate) or not np.isfinite(lat_rate) or not np.isfinite(dz):
 		return None
 
 	new_alt = alt_m + dz
 	if (lower_boundary is not None and new_alt < lower_boundary) or (upper_boundary is not None and new_alt > upper_boundary):
 		return None
 
-	new_lon = lon + lon_offset
-	new_lat = lat + lat_offset
+	new_lon_rad = lon_rad + lon_rate * dt
+	new_lat_rad = lat_rad + lat_rate * dt
+	if not np.isfinite(new_lon_rad) or not np.isfinite(new_lat_rad):
+		return None
+
+	new_lat = np.rad2deg(new_lat_rad)
+	new_lon = np.rad2deg(new_lon_rad)
 	new_lat, new_lon = normalize_lat_lon(new_lat, new_lon, lon_mode)
 
 	return (new_lon, new_lat, new_alt)
 
+def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
+				u_mid_slice, v_mid_slice, w_mid_slice,
+				alt_grid, lat_grid, lon_grid,
+				radius, lower_boundary, upper_boundary,
+				lon_mode, w_positive_up,
+				picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
+	"""
+	Perform a single implicit midpoint step for one particle.
+	Returns the new (lon, lat, alt) tuple or None if the trajectory exits the domain.
+	"""
+	if not np.isfinite(dt) or dt == 0.0:
+		return (lon_now, lat_now, alt_now)
+
+	picard_iters = int(picard_iters) if picard_iters is not None else 0
+	if picard_iters < 0:
+		raise ValueError('picard_iters must be non-negative')
+
+	if picard_tol is not None:
+		if np.isscalar(picard_tol):
+			lon_tol = lat_tol = alt_tol = float(picard_tol)
+		else:
+			picard_tol = tuple(picard_tol)
+			if len(picard_tol) != 3:
+				raise ValueError('picard_tol must be scalar or length-3 sequence')
+			lon_tol = float(picard_tol[0])
+			lat_tol = float(picard_tol[1])
+			alt_tol = float(picard_tol[2])
+	else:
+		lon_tol = lat_tol = alt_tol = None
+
+	initial_wind = get_interpolated_winds(
+		alt_now, lat_now, lon_now,
+		u_mid_slice, v_mid_slice, w_mid_slice,
+		alt_grid, lat_grid, lon_grid, lon_mode=lon_mode
+	)
+	if np.any(np.isnan(initial_wind)):
+		return None
+
+	initial_state = get_next_position_alt(
+		lon_now, lat_now, alt_now, initial_wind, dt, radius,
+		lower_boundary, upper_boundary, lon_mode=lon_mode, w_positive_up=w_positive_up
+	)
+	if initial_state is None:
+		return None
+
+	if picard_iters == 0:
+		return initial_state
+
+	lon_current, lat_current, alt_current = initial_state
+
+	min_abs_cos = 1e-6
+	lon_now_rad = np.deg2rad(lon_now)
+	lat_now_rad = np.deg2rad(lat_now)
+
+	for _ in range(picard_iters):
+		if use_slerp_midpoint:
+			mid_lat, mid_lon = midpoint_on_sphere(lat_now, lon_now, lat_current, lon_current, lon_mode)
+		else:
+			delta_lon = mod_longitude(lon_current - lon_now)
+			mid_lon = lon_now + 0.5 * delta_lon
+			if lon_mode is None:
+				mid_lon = mod_longitude(mid_lon)
+			else:
+				mid_lon = normalize_lon_to_mode(mid_lon, lon_mode)
+			mid_lat = 0.5 * (lat_now + lat_current)
+			if mid_lat > 90.0:
+				mid_lat = 90.0
+			elif mid_lat < -90.0:
+				mid_lat = -90.0
+
+		alt_mid = 0.5 * (alt_now + alt_current)
+		mid_wind = get_interpolated_winds(
+			alt_mid, mid_lat, mid_lon,
+			u_mid_slice, v_mid_slice, w_mid_slice,
+			alt_grid, lat_grid, lon_grid, lon_mode=lon_mode
+		)
+		if np.any(np.isnan(mid_wind)):
+			return None
+
+		cos_lat_mid = np.cos(np.deg2rad(mid_lat))
+		if not np.isfinite(cos_lat_mid):
+			return None
+		if cos_lat_mid >= 0.0:
+			cos_lat_mid = max(cos_lat_mid, min_abs_cos)
+		else:
+			cos_lat_mid = min(cos_lat_mid, -min_abs_cos)
+
+		lon_rate = mid_wind[0] / (radius * cos_lat_mid)
+		lat_rate = mid_wind[1] / radius
+		dz = mid_wind[2] * dt if w_positive_up else -mid_wind[2] * dt
+
+		if (not np.isfinite(lon_rate)) or (not np.isfinite(lat_rate)) or (not np.isfinite(dz)):
+			return None
+
+		lon_candidate_rad = lon_now_rad + lon_rate * dt
+		lat_candidate_rad = lat_now_rad + lat_rate * dt
+		if (not np.isfinite(lon_candidate_rad)) or (not np.isfinite(lat_candidate_rad)):
+			return None
+
+		alt_candidate = alt_now + dz
+		if (lower_boundary is not None and alt_candidate < lower_boundary) or (upper_boundary is not None and alt_candidate > upper_boundary):
+			return None
+
+		lon_candidate = np.rad2deg(lon_candidate_rad)
+		lat_candidate = np.rad2deg(lat_candidate_rad)
+		lat_candidate, lon_candidate = normalize_lat_lon(lat_candidate, lon_candidate, lon_mode)
+
+		if (not np.isfinite(lon_candidate)) or (not np.isfinite(lat_candidate)) or (not np.isfinite(alt_candidate)):
+			return None
+
+		if lon_tol is not None:
+			angular_diff = abs(mod_longitude(lon_candidate - lon_current))
+			lat_diff = abs(lat_candidate - lat_current)
+			alt_diff = abs(alt_candidate - alt_current)
+			if angular_diff <= lon_tol and lat_diff <= lat_tol and alt_diff <= alt_tol:
+				lon_current, lat_current, alt_current = lon_candidate, lat_candidate, alt_candidate
+				break
+
+		lon_current, lat_current, alt_current = lon_candidate, lat_candidate, alt_candidate
+
+	return (lon_current, lat_current, alt_current)
+
 def get_trace_time_heun(new_time_points):
+	return new_time_points[1:]
+
+def get_trace_time_midpoint(new_time_points):
 	return new_time_points[1:]
 
 def get_trace_time_heun_backward(time, start_index=None, start_time=None, n_steps=None):
@@ -566,3 +797,298 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 		new_position_dict_list.append(next_positions)
 
 	return new_position_dict_list
+
+
+def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
+				alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
+				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
+				picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
+	"""
+	Track particles using the implicit midpoint method with altitude (m) and vertical velocity (m/s).
+	Particles stop when altitude crosses the provided boundaries or when interpolated wind components are NaN.
+	"""
+	time = np.asarray(time)
+	if time.ndim != 1:
+		raise ValueError('time must be one-dimensional')
+	if time.size < 2:
+		raise ValueError('time array must have at least two points for midpoint integration')
+	if not np.all(np.diff(time) > 0):
+		raise ValueError('time array must be strictly increasing')
+
+	lat_grid = np.asarray(lat_grid)
+	lon_grid = np.asarray(lon_grid)
+	alt_grid = np.asarray(alt_grid_m)
+	u_time_interp = np.asarray(u_time_interp)
+	v_time_interp = np.asarray(v_time_interp)
+	w_time_interp = np.asarray(w_time_interp)
+
+	if u_time_interp.shape != v_time_interp.shape or u_time_interp.shape != w_time_interp.shape:
+		raise ValueError('u, v, w interpolated arrays must have identical shapes')
+	if u_time_interp.shape[0] != time.size:
+		raise ValueError('time dimension mismatch between wind fields and time array')
+	if u_time_interp.shape[1] != alt_grid.size:
+		raise ValueError('altitude dimension mismatch between wind fields and altitude grid')
+	if u_time_interp.shape[2] != lat_grid.size or u_time_interp.shape[3] != lon_grid.size:
+		raise ValueError('horizontal dimensions mismatch between wind fields and latitude/longitude grids')
+
+	if lat_grid.ndim != 1 or lon_grid.ndim != 1 or alt_grid.ndim != 1:
+		raise ValueError('alt_grid, lat_grid, lon_grid must be one-dimensional')
+	if not np.all(np.diff(lat_grid) > 0):
+		raise ValueError('lat grid must be strictly increasing')
+	if not np.all(np.diff(lon_grid) > 0):
+		raise ValueError('lon grid must be strictly increasing')
+
+	sort_idx = np.argsort(alt_grid)
+	alt_sorted = alt_grid[sort_idx]
+	if not np.all(np.diff(alt_sorted) > 0):
+		raise ValueError('altitude grid must be strictly increasing after sorting')
+
+	u_sorted = np.take(u_time_interp, sort_idx, axis=1)
+	v_sorted = np.take(v_time_interp, sort_idx, axis=1)
+	w_sorted = np.take(w_time_interp, sort_idx, axis=1)
+
+	if lon_mode is None:
+		lon_mode = infer_lon_mode(lon_grid)
+
+	positions = {}
+	active = {}
+	for point in need_track_initial_points:
+		if len(point) != 3:
+			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
+		lon0, lat0, alt0 = point
+		if not np.isfinite(alt0):
+			raise ValueError('Initial altitude must be finite')
+		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
+		positions[point] = (lon0, lat0, alt0)
+		active[point] = True
+
+	new_position_dict_list = []
+	iterator = range(time.size - 1)
+	if verbose:
+		iterator = tqdm(iterator, desc='Midpoint integration along time axis')
+
+	for itime in iterator:
+		dt = float(time[itime + 1] - time[itime])
+		if not np.isfinite(dt) or dt <= 0:
+			raise ValueError('time array must be strictly increasing with finite step')
+
+		u_slice_now = u_sorted[itime, :, :, :]
+		v_slice_now = v_sorted[itime, :, :, :]
+		w_slice_now = w_sorted[itime, :, :, :]
+		u_slice_next = u_sorted[itime + 1, :, :, :]
+		v_slice_next = v_sorted[itime + 1, :, :, :]
+		w_slice_next = w_sorted[itime + 1, :, :, :]
+
+		u_mid_slice = 0.5 * (u_slice_now + u_slice_next)
+		v_mid_slice = 0.5 * (v_slice_now + v_slice_next)
+		w_mid_slice = 0.5 * (w_slice_now + w_slice_next)
+
+		next_positions = {}
+		for point, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[point]:
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			new_pos = step_implicit_midpoint_alt(
+				lon_now, lat_now, alt_now, dt,
+				u_mid_slice, v_mid_slice, w_mid_slice,
+				alt_sorted, lat_grid, lon_grid,
+				radius, lower_boundary, upper_boundary,
+				lon_mode, w_positive_up,
+				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
+			)
+			if new_pos is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+			else:
+				next_positions[point] = new_pos
+
+		positions = next_positions
+		new_position_dict_list.append(next_positions)
+
+	return new_position_dict_list
+
+
+def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
+					alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
+					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
+					start_index=None, start_time=None, n_steps=None,
+					picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
+	"""
+	Backward implicit midpoint integration using altitude (m) and vertical velocity (m/s).
+	Particles are traced from later to earlier times without negating the wind fields.
+	Particles stop when altitude crosses the supplied boundaries or interpolated winds are NaN.
+	"""
+	time = np.asarray(time)
+	if time.ndim != 1:
+		raise ValueError('time must be one-dimensional')
+	if time.size < 2:
+		raise ValueError('time array must have at least two points for midpoint integration')
+	if not np.all(np.diff(time) > 0):
+		raise ValueError('time array must be strictly increasing')
+
+	if start_index is not None and start_time is not None:
+		raise ValueError('Provide only one of start_index or start_time')
+
+	lat_grid = np.asarray(lat_grid)
+	lon_grid = np.asarray(lon_grid)
+	alt_grid = np.asarray(alt_grid_m)
+	u_time_interp = np.asarray(u_time_interp)
+	v_time_interp = np.asarray(v_time_interp)
+	w_time_interp = np.asarray(w_time_interp)
+
+	if u_time_interp.shape != v_time_interp.shape or u_time_interp.shape != w_time_interp.shape:
+		raise ValueError('u, v, w interpolated arrays must have identical shapes')
+	if u_time_interp.shape[0] != time.size:
+		raise ValueError('time dimension mismatch between wind fields and time array')
+	if u_time_interp.shape[1] != alt_grid.size:
+		raise ValueError('altitude dimension mismatch between wind fields and altitude grid')
+	if u_time_interp.shape[2] != lat_grid.size or u_time_interp.shape[3] != lon_grid.size:
+		raise ValueError('horizontal dimensions mismatch between wind fields and latitude/longitude grids')
+
+	if lat_grid.ndim != 1 or lon_grid.ndim != 1 or alt_grid.ndim != 1:
+		raise ValueError('alt_grid, lat_grid, lon_grid must be one-dimensional')
+	if not np.all(np.diff(lat_grid) > 0):
+		raise ValueError('lat grid must be strictly increasing')
+	if not np.all(np.diff(lon_grid) > 0):
+		raise ValueError('lon grid must be strictly increasing')
+
+	sort_idx = np.argsort(alt_grid)
+	alt_sorted = alt_grid[sort_idx]
+	if not np.all(np.diff(alt_sorted) > 0):
+		raise ValueError('altitude grid must be strictly increasing after sorting')
+
+	u_sorted = np.take(u_time_interp, sort_idx, axis=1)
+	v_sorted = np.take(v_time_interp, sort_idx, axis=1)
+	w_sorted = np.take(w_time_interp, sort_idx, axis=1)
+
+	if lon_mode is None:
+		lon_mode = infer_lon_mode(lon_grid)
+
+	if start_index is not None:
+		start_idx = int(start_index)
+		if start_idx < 1 or start_idx >= time.size:
+			raise ValueError('start_index must satisfy 1 <= start_index < len(time)')
+	else:
+		if start_time is None:
+			start_idx = time.size - 1
+		else:
+			matches = np.where(np.isclose(time, start_time, rtol=0.0, atol=0.0))[0]
+			if matches.size == 0:
+				raise ValueError('start_time must match one of the entries in time array')
+			start_idx = int(matches[-1])
+			if start_idx < 1:
+				raise ValueError('start_time corresponds to the earliest sample; cannot step backward')
+
+	if n_steps is not None:
+		n_steps = int(n_steps)
+		if n_steps < 1:
+			raise ValueError('n_steps must be >= 1 when provided')
+		end_idx = max(start_idx - n_steps, 0)
+	else:
+		end_idx = 0
+
+	if start_idx == end_idx:
+		return []
+
+	positions = {}
+	active = {}
+	for point in need_track_initial_points:
+		if len(point) != 3:
+			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
+		lon0, lat0, alt0 = point
+		if not np.isfinite(alt0):
+			raise ValueError('Initial altitude must be finite')
+		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
+		positions[point] = (lon0, lat0, alt0)
+		active[point] = True
+
+	new_position_dict_list = []
+	iterator = range(start_idx, end_idx, -1)
+	if verbose:
+		iterator = tqdm(iterator, desc='Midpoint backward integration along time axis')
+
+	for itime in iterator:
+		delta = float(time[itime] - time[itime - 1])
+		if not np.isfinite(delta) or delta <= 0:
+			raise ValueError('time array must be strictly increasing with finite step')
+		dt = -delta
+
+		u_slice_now = u_sorted[itime, :, :, :]
+		v_slice_now = v_sorted[itime, :, :, :]
+		w_slice_now = w_sorted[itime, :, :, :]
+		u_slice_prev = u_sorted[itime - 1, :, :, :]
+		v_slice_prev = v_sorted[itime - 1, :, :, :]
+		w_slice_prev = w_sorted[itime - 1, :, :, :]
+
+		u_mid_slice = 0.5 * (u_slice_now + u_slice_prev)
+		v_mid_slice = 0.5 * (v_slice_now + v_slice_prev)
+		w_mid_slice = 0.5 * (w_slice_now + w_slice_prev)
+
+		next_positions = {}
+		for point, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[point]:
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			new_pos = step_implicit_midpoint_alt(
+				lon_now, lat_now, alt_now, dt,
+				u_mid_slice, v_mid_slice, w_mid_slice,
+				alt_sorted, lat_grid, lon_grid,
+				radius, lower_boundary, upper_boundary,
+				lon_mode, w_positive_up,
+				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
+			)
+			if new_pos is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+			else:
+				next_positions[point] = new_pos
+
+		positions = next_positions
+		new_position_dict_list.append(next_positions)
+
+	return new_position_dict_list
+
+
+def get_trace_time_midpoint_backward(time, start_index=None, start_time=None, n_steps=None):
+	"""Return time stamps associated with backward midpoint integration steps."""
+	time = np.asarray(time)
+	if time.ndim != 1:
+		raise ValueError('time must be one-dimensional')
+	if time.size < 2:
+		raise ValueError('time array must contain at least two entries')
+	if not np.all(np.diff(time) > 0):
+		raise ValueError('time array must be strictly increasing')
+
+	if start_index is not None and start_time is not None:
+		raise ValueError('Provide only one of start_index or start_time')
+
+	if start_index is not None:
+		start_idx = int(start_index)
+		if start_idx < 1 or start_idx >= time.size:
+			raise ValueError('start_index must satisfy 1 <= start_index < len(time)')
+	else:
+		if start_time is None:
+			start_idx = time.size - 1
+		else:
+			matches = np.where(np.isclose(time, start_time, rtol=0.0, atol=0.0))[0]
+			if matches.size == 0:
+				raise ValueError('start_time must match one of the entries in time array')
+			start_idx = int(matches[-1])
+			if start_idx < 1:
+				raise ValueError('start_time corresponds to the earliest sample; cannot step backward')
+
+	if n_steps is not None:
+		n_steps = int(n_steps)
+		if n_steps < 1:
+			raise ValueError('n_steps must be >= 1 when provided')
+		end_idx = max(start_idx - n_steps, 0)
+	else:
+		end_idx = 0
+
+	if start_idx == end_idx:
+		return np.array([], dtype=time.dtype)
+
+	indices = np.arange(start_idx - 1, end_idx - 1, -1, dtype=int)
+	return time[indices]
