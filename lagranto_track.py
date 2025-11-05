@@ -909,6 +909,131 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 	return new_position_dict_list
 
 
+def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, lat_grid, lon_grid, lon_mode=None):
+	"""
+	Sample a time-interpolated scalar field along midpoint integration steps.
+
+	Parameters:
+	- mid_steps: list of dicts produced by track_particles_midpoint.
+	- scalar_time_interp: array with shape (T, Z, Y, X) aligned with the time grid used for midpoint tracking.
+	- alt_grid_m, lat_grid, lon_grid: one-dimensional coordinate arrays for altitude (m), latitude, and longitude.
+	- lon_mode: optional longitude normalization mode; inferred from lon_grid when omitted.
+
+	Returns:
+	- List of dictionaries mirroring mid_steps, containing scalar values at the terminal position of each step.
+	"""
+	if not isinstance(mid_steps, list):
+		raise ValueError('mid_steps must be a list of dictionaries')
+
+	scalar_time_interp = np.asarray(scalar_time_interp)
+	alt_grid = np.asarray(alt_grid_m)
+	lat_grid = np.asarray(lat_grid)
+	lon_grid = np.asarray(lon_grid, dtype=np.float64)
+
+	if scalar_time_interp.ndim != 4:
+		raise ValueError('scalar_time_interp must be a 4D array of shape (time, altitude, latitude, longitude)')
+	if alt_grid.ndim != 1 or lat_grid.ndim != 1 or lon_grid.ndim != 1:
+		raise ValueError('alt_grid_m, lat_grid, lon_grid must be one-dimensional')
+	if scalar_time_interp.shape[0] != len(mid_steps) + 1:
+		raise ValueError('time dimension of scalar_time_interp must be len(mid_steps) + 1')
+	if scalar_time_interp.shape[1] != alt_grid.size:
+		raise ValueError('altitude dimension mismatch between scalar_time_interp and alt_grid_m')
+	if scalar_time_interp.shape[2] != lat_grid.size or scalar_time_interp.shape[3] != lon_grid.size:
+		raise ValueError('latitude/longitude dimensions mismatch between scalar_time_interp and provided grids')
+	if not np.all(np.diff(lat_grid) > 0):
+		raise ValueError('lat_grid must be strictly increasing')
+	if not np.all(np.diff(lon_grid) > 0):
+		raise ValueError('lon_grid must be strictly increasing')
+
+	sort_idx = np.argsort(alt_grid)
+	alt_sorted = alt_grid[sort_idx]
+	if not np.all(np.diff(alt_sorted) > 0):
+		raise ValueError('altitude grid must contain unique, strictly increasing values')
+
+	scalar_sorted = np.take(scalar_time_interp, sort_idx, axis=1)
+
+	if lon_mode is None:
+		lon_mode = infer_lon_mode(lon_grid)
+
+	periodic = False
+	lon_ext = lon_grid
+	scalar_ext = scalar_sorted
+
+	if lon_grid.size >= 2 and np.all(np.diff(lon_grid) > 0):
+		diff = np.diff(lon_grid)
+		step = float(np.min(diff))
+		if step > 0.0 and np.isfinite(step):
+			span = float(lon_grid[-1] - lon_grid[0])
+			if np.isfinite(span):
+				full_span = span + step
+				wrap = 360.0
+				if np.isclose(full_span % wrap, 0.0, atol=1e-6) or np.isclose(full_span, wrap, atol=1e-6):
+					wrap_value = lon_grid[0] + wrap
+					if wrap_value <= lon_grid[-1] + 1e-6:
+						wrap_value = lon_grid[-1] + step
+					lon_ext = np.concatenate([lon_grid, [wrap_value]])
+					scalar_ext = np.concatenate([scalar_sorted, scalar_sorted[..., :1]], axis=-1)
+					periodic = True
+
+	results = []
+	for step_index, position_dict in enumerate(mid_steps):
+		if not isinstance(position_dict, dict):
+			raise ValueError('Each entry in mid_steps must be a dictionary')
+
+		field_slice = scalar_ext[step_index + 1, :, :, :]
+		interpolator = RegularGridInterpolator(
+			(alt_sorted, lat_grid, lon_ext),
+			field_slice,
+			method='linear',
+			bounds_error=False,
+			fill_value=np.nan
+		)
+
+		keys = []
+		point_coords = []
+		for key, position in position_dict.items():
+			keys.append(key)
+			if position is None:
+				point_coords.append([np.nan, np.nan, np.nan])
+				continue
+			if len(position) != 3:
+				raise ValueError('Trajectory positions must be length-3 (lon, lat, alt)')
+			lon_now, lat_now, alt_now = position
+
+			if not (np.isfinite(lon_now) and np.isfinite(lat_now) and np.isfinite(alt_now)):
+				point_coords.append([np.nan, np.nan, np.nan])
+				continue
+
+			lat_norm, lon_norm = normalize_lat_lon(float(lat_now), float(lon_now), lon_mode)
+
+			if periodic:
+				span = lon_ext[-1] - lon_ext[0]
+				if span > 0.0 and np.isfinite(span):
+					lon_norm = ((lon_norm - lon_ext[0]) % span) + lon_ext[0]
+					if lon_norm > lon_ext[-1]:
+						lon_norm = lon_ext[-1]
+			else:
+				lon_norm = float(np.clip(lon_norm, lon_ext[0], lon_ext[-1]))
+
+			point_coords.append([float(alt_now), lat_norm, lon_norm])
+
+		if point_coords:
+			points_array = np.asarray(point_coords, dtype=np.float64)
+			values = np.full(points_array.shape[0], np.nan, dtype=np.float64)
+			valid_mask = np.all(np.isfinite(points_array), axis=1)
+			if np.any(valid_mask):
+				values[valid_mask] = interpolator(points_array[valid_mask])
+		else:
+			values = np.array([], dtype=np.float64)
+
+		result_dict = {}
+		for key, value in zip(keys, values):
+			result_dict[key] = float(value) if np.isfinite(value) else np.nan
+		results.append(result_dict)
+
+	return results
+
+
 def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 					alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
 					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
