@@ -215,7 +215,65 @@ def normalize_lon_to_mode(lon, mode):
 		return lon % 360.0
 	return mod_longitude(lon)
 
-def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, lat_grid, lon_grid, lon_mode=None):
+
+def _prepare_lon_periodic_extension(lon_grid, field, periodic_lon='auto', wrap=360.0, atol=1e-6):
+	"""
+	Prepare a longitude grid for RegularGridInterpolator.
+
+	Returns (lon_ext, field_ext, periodic) where lon_ext is strictly increasing.
+	When periodicity is enabled, lon_ext includes one additional wrap point and field_ext
+	duplicates the first longitude column at the end.
+
+	Supports global grids with or without a duplicate endpoint (e.g. [-180,...,180]).
+	Assumes the longitude dimension is the last axis of `field`.
+	"""
+	lon_grid = np.asarray(lon_grid, dtype=np.float64)
+	field = np.asarray(field)
+
+	if periodic_lon is None:
+		periodic_lon = 'auto'
+	if periodic_lon not in (True, False, 'auto'):
+		raise ValueError("periodic_lon must be True, False, or 'auto'")
+
+	if lon_grid.ndim != 1 or lon_grid.size < 2:
+		return lon_grid, field, False
+	if not np.all(np.diff(lon_grid) > 0):
+		return lon_grid, field, False
+
+	diff = np.diff(lon_grid)
+	step = float(np.nanmedian(diff))
+	if not np.isfinite(step) or step <= 0.0:
+		return lon_grid, field, False
+
+	span = float(lon_grid[-1] - lon_grid[0])
+	if not np.isfinite(span):
+		return lon_grid, field, False
+
+	tol = max(float(atol), 1e-8 * wrap, 1e-6 * abs(step))
+	covers_global = (np.isclose(span + step, wrap, atol=tol) or np.isclose(span, wrap, atol=tol))
+
+	if periodic_lon is True and not covers_global:
+		raise ValueError('periodic_lon=True requires a global longitude grid covering ~360 degrees')
+	if periodic_lon is False or (periodic_lon == 'auto' and not covers_global):
+		return lon_grid, field, False
+
+	lon_base = lon_grid
+	field_base = field
+	if np.isclose(span, wrap, atol=tol):
+		# Duplicate endpoint grid, e.g. [-180,...,180] or [0,...,360].
+		# Drop the last point so the grid becomes half-open and strictly increasing.
+		if lon_grid.size < 3:
+			raise ValueError('duplicate-endpoint longitude grid must have at least 3 points')
+		lon_base = lon_grid[:-1]
+		field_base = field[..., :-1]
+
+	wrap_value = lon_base[0] + wrap
+	lon_ext = np.concatenate([lon_base, [wrap_value]])
+	field_ext = np.concatenate([field_base, field_base[..., :1]], axis=-1)
+	return lon_ext, field_ext, True
+
+
+def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, lat_grid, lon_grid, lon_mode=None, periodic_lon='auto'):
 	"""Helper function to get interpolated winds at a point"""
 	alt_grid = np.asarray(alt_grid)
 	lat_grid = np.asarray(lat_grid)
@@ -224,29 +282,16 @@ def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, l
 	v_field = np.asarray(v_field)
 	w_field = np.asarray(w_field)
 
-	periodic = False
-	lon_ext = lon_grid
-	u_ext = u_field
-	v_ext = v_field
-	w_ext = w_field
-
-	if lon_grid.ndim == 1 and lon_grid.size >= 2 and np.all(np.diff(lon_grid) > 0):
-		diff = np.diff(lon_grid)
-		step = float(np.min(diff))
-		if step > 0.0 and np.isfinite(step):
-			span = float(lon_grid[-1] - lon_grid[0])
-			if np.isfinite(span):
-				full_span = span + step
-				wrap = 360.0
-				if np.isclose(full_span % wrap, 0.0, atol=1e-6) or np.isclose(full_span, wrap, atol=1e-6):
-					wrap_value = lon_grid[0] + wrap
-					if wrap_value <= lon_grid[-1] + 1e-6:
-						wrap_value = lon_grid[-1] + step
-					lon_ext = np.concatenate([lon_grid, [wrap_value]])
-					u_ext = np.concatenate([u_field, u_field[..., :1]], axis=-1)
-					v_ext = np.concatenate([v_field, v_field[..., :1]], axis=-1)
-					w_ext = np.concatenate([w_field, w_field[..., :1]], axis=-1)
-					periodic = True
+	lon_ext, u_ext, periodic = _prepare_lon_periodic_extension(lon_grid, u_field, periodic_lon=periodic_lon)
+	if periodic:
+		duplicate_endpoint = lon_ext.shape[0] == lon_grid.shape[0]
+		v_base = v_field[..., :-1] if duplicate_endpoint else v_field
+		w_base = w_field[..., :-1] if duplicate_endpoint else w_field
+		v_ext = np.concatenate([v_base, v_base[..., :1]], axis=-1)
+		w_ext = np.concatenate([w_base, w_base[..., :1]], axis=-1)
+	else:
+		v_ext = v_field
+		w_ext = w_field
 
 	if lon_mode is not None:
 		lon = normalize_lon_to_mode(lon, lon_mode)
@@ -261,7 +306,15 @@ def get_interpolated_winds(alt, lat, lon, u_field, v_field, w_field, alt_grid, l
 			if lon > lon_ext[-1]:
 				lon = lon_ext[-1]
 	else:
-		lon = float(np.clip(lon, lon_ext[0], lon_ext[-1]))
+		# Do not clip by default: out-of-range longitudes should produce NaN via fill_value
+		# so that trajectory integration can stop instead of sticking to the boundary.
+		lon_min = float(lon_ext[0])
+		lon_max = float(lon_ext[-1])
+		soft_tol = 1e-12
+		if lon < lon_min and lon >= lon_min - soft_tol:
+			lon = lon_min
+		elif lon > lon_max and lon <= lon_max + soft_tol:
+			lon = lon_max
 
 	interp_point = np.array([[alt, lat, lon]], dtype=np.float64)
 
@@ -312,8 +365,8 @@ def get_next_position_alt(lon, lat, alt_m, wind, dt, radius, lower_boundary, upp
 	else:
 		cos_lat = min(cos_lat, -min_abs_cos)
 
-	lon_rate = wind[0] / (radius * cos_lat)
-	lat_rate = wind[1] / radius
+	lon_rate = wind[0] / ((radius + alt_m) * cos_lat)
+	lat_rate = wind[1] / (radius + alt_m)
 	dz = wind[2] * dt if w_positive_up else -wind[2] * dt
 
 	if not np.isfinite(lon_rate) or not np.isfinite(lat_rate) or not np.isfinite(dz):
@@ -338,7 +391,7 @@ def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
 				u_mid_slice, v_mid_slice, w_mid_slice,
 				alt_grid, lat_grid, lon_grid,
 				radius, lower_boundary, upper_boundary,
-				lon_mode, w_positive_up,
+				lon_mode, w_positive_up, periodic_lon='auto',
 				picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
 	"""
 	Perform a single implicit midpoint step for one particle.
@@ -367,7 +420,7 @@ def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
 	initial_wind = get_interpolated_winds(
 		alt_now, lat_now, lon_now,
 		u_mid_slice, v_mid_slice, w_mid_slice,
-		alt_grid, lat_grid, lon_grid, lon_mode=lon_mode
+		alt_grid, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 	)
 	if np.any(np.isnan(initial_wind)):
 		return None
@@ -408,7 +461,7 @@ def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
 		mid_wind = get_interpolated_winds(
 			alt_mid, mid_lat, mid_lon,
 			u_mid_slice, v_mid_slice, w_mid_slice,
-			alt_grid, lat_grid, lon_grid, lon_mode=lon_mode
+			alt_grid, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 		)
 		if np.any(np.isnan(mid_wind)):
 			return None
@@ -421,8 +474,8 @@ def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
 		else:
 			cos_lat_mid = min(cos_lat_mid, -min_abs_cos)
 
-		lon_rate = mid_wind[0] / (radius * cos_lat_mid)
-		lat_rate = mid_wind[1] / radius
+		lon_rate = mid_wind[0] / ((radius + alt_mid) * cos_lat_mid)
+		lat_rate = mid_wind[1] / (radius + alt_mid)
 		dz = mid_wind[2] * dt if w_positive_up else -mid_wind[2] * dt
 
 		if (not np.isfinite(lon_rate)) or (not np.isfinite(lat_rate)) or (not np.isfinite(dz)):
@@ -506,7 +559,7 @@ def get_trace_time_heun_backward(time, start_index=None, start_time=None, n_step
 
 def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 				alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
-				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None):
+				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto'):
 	"""
 	Track particles using Heun's method with altitude (m) and vertical velocity (m/s).
 	Particles stop when altitude crosses the provided boundaries or when any interpolated
@@ -592,7 +645,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 			k1_wind = get_interpolated_winds(
 				alt_now, lat_now, lon_now,
 				u_slice_now, v_slice_now, w_slice_now,
-				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode
+				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k1_wind)):
 				active[point] = False
@@ -612,7 +665,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 			k2_wind = get_interpolated_winds(
 				pred_alt, pred_lat, pred_lon,
 				u_slice_next, v_slice_next, w_slice_next,
-				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode
+				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k2_wind)):
 				active[point] = False
@@ -638,7 +691,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 
 def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 					alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
-					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
+					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto',
 					start_index=None, start_time=None, n_steps=None):
 	"""
 	Backward Heun integration using altitude (m) and vertical velocity (m/s).
@@ -755,7 +808,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 			k1_wind = get_interpolated_winds(
 				alt_now, lat_now, lon_now,
 				u_slice_now, v_slice_now, w_slice_now,
-				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode
+				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k1_wind)):
 				active[point] = False
@@ -775,7 +828,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 			k2_wind = get_interpolated_winds(
 				pred_alt, pred_lat, pred_lon,
 				u_slice_prev, v_slice_prev, w_slice_prev,
-				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode
+				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k2_wind)):
 				active[point] = False
@@ -801,7 +854,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 
 def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 				alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
-				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
+				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto',
 				picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
 	"""
 	Track particles using the implicit midpoint method with altitude (m) and vertical velocity (m/s).
@@ -894,7 +947,7 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 				u_mid_slice, v_mid_slice, w_mid_slice,
 				alt_sorted, lat_grid, lon_grid,
 				radius, lower_boundary, upper_boundary,
-				lon_mode, w_positive_up,
+				lon_mode, w_positive_up, periodic_lon=periodic_lon,
 				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
 			)
 			if new_pos is None:
@@ -909,7 +962,7 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 	return new_position_dict_list
 
 
-def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, lat_grid, lon_grid, lon_mode=None):
+def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, lat_grid, lon_grid, lon_mode=None, periodic_lon='auto'):
 	"""
 	Sample a time-interpolated scalar field along midpoint integration steps.
 
@@ -918,6 +971,7 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 	- scalar_time_interp: array with shape (T, Z, Y, X) aligned with the time grid used for midpoint tracking.
 	- alt_grid_m, lat_grid, lon_grid: one-dimensional coordinate arrays for altitude (m), latitude, and longitude.
 	- lon_mode: optional longitude normalization mode; inferred from lon_grid when omitted.
+	- periodic_lon: True/False/'auto' to control periodic longitude wrapping (auto detects global grids).
 
 	Returns:
 	- List of dictionaries mirroring mid_steps, containing scalar values at the terminal position of each step.
@@ -955,25 +1009,7 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 	if lon_mode is None:
 		lon_mode = infer_lon_mode(lon_grid)
 
-	periodic = False
-	lon_ext = lon_grid
-	scalar_ext = scalar_sorted
-
-	if lon_grid.size >= 2 and np.all(np.diff(lon_grid) > 0):
-		diff = np.diff(lon_grid)
-		step = float(np.min(diff))
-		if step > 0.0 and np.isfinite(step):
-			span = float(lon_grid[-1] - lon_grid[0])
-			if np.isfinite(span):
-				full_span = span + step
-				wrap = 360.0
-				if np.isclose(full_span % wrap, 0.0, atol=1e-6) or np.isclose(full_span, wrap, atol=1e-6):
-					wrap_value = lon_grid[0] + wrap
-					if wrap_value <= lon_grid[-1] + 1e-6:
-						wrap_value = lon_grid[-1] + step
-					lon_ext = np.concatenate([lon_grid, [wrap_value]])
-					scalar_ext = np.concatenate([scalar_sorted, scalar_sorted[..., :1]], axis=-1)
-					periodic = True
+	lon_ext, scalar_ext, periodic = _prepare_lon_periodic_extension(lon_grid, scalar_sorted, periodic_lon=periodic_lon)
 
 	results = []
 	for step_index, position_dict in enumerate(mid_steps):
@@ -1013,7 +1049,13 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 					if lon_norm > lon_ext[-1]:
 						lon_norm = lon_ext[-1]
 			else:
-				lon_norm = float(np.clip(lon_norm, lon_ext[0], lon_ext[-1]))
+				lon_min = float(lon_ext[0])
+				lon_max = float(lon_ext[-1])
+				soft_tol = 1e-12
+				if lon_norm < lon_min and lon_norm >= lon_min - soft_tol:
+					lon_norm = lon_min
+				elif lon_norm > lon_max and lon_norm <= lon_max + soft_tol:
+					lon_norm = lon_max
 
 			point_coords.append([float(alt_now), lat_norm, lon_norm])
 
@@ -1036,7 +1078,7 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 
 def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 					alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
-					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None,
+					radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto',
 					start_index=None, start_time=None, n_steps=None,
 					picard_iters=3, picard_tol=None, use_slerp_midpoint=True):
 	"""
@@ -1161,7 +1203,7 @@ def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time
 				u_mid_slice, v_mid_slice, w_mid_slice,
 				alt_sorted, lat_grid, lon_grid,
 				radius, lower_boundary, upper_boundary,
-				lon_mode, w_positive_up,
+				lon_mode, w_positive_up, periodic_lon=periodic_lon,
 				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
 			)
 			if new_pos is None:
