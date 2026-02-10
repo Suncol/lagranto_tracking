@@ -25,64 +25,86 @@ def change_vertical_wind_unit_from_m_per_s_to_Pa_per_s(w, rho, g=3.71):
 	return w * rho * g
 
 @jit(nopython=True)
+def _validate_time_known_strictly_increasing(time_known, expected_len):
+	if time_known.ndim != 1:
+		raise ValueError('time_known must be one-dimensional')
+	if time_known.shape[0] != expected_len:
+		raise ValueError('time_known length must equal data.shape[0]')
+	if expected_len < 1:
+		raise ValueError('time_known must contain at least one entry')
+	first_val = time_known[0]
+	if not np.isfinite(first_val):
+		raise ValueError('time_known must contain only finite values')
+	prev = first_val
+	for k in range(1, expected_len):
+		current = time_known[k]
+		if not np.isfinite(current):
+			raise ValueError('time_known must contain only finite values')
+		if not (current > prev):
+			raise ValueError('time_known must be strictly increasing')
+		prev = current
+
+
+@jit(nopython=True)
+def _interpolate_time_core(data, time_known, time_target):
+	T = data.shape[0]
+	spatial_shape = data.shape[1:]
+	T_target = time_target.shape[0]
+
+	result = np.empty((T_target,) + spatial_shape, dtype=np.float64)
+
+	for idx in range(T_target):
+		t = time_target[idx]
+
+		# Keep NaN targets as NaN and avoid accidental clipping.
+		if not (t == t):
+			result[idx] = np.nan
+			continue
+
+		if t <= time_known[0]:
+			result[idx] = data[0]
+			continue
+		if t >= time_known[T - 1]:
+			result[idx] = data[T - 1]
+			continue
+
+		found = False
+		for j in range(T - 1):
+			if (time_known[j] <= t) and (t <= time_known[j + 1]):
+				denom = time_known[j + 1] - time_known[j]
+				w = (t - time_known[j]) / denom
+				result[idx] = (1.0 - w) * data[j] + w * data[j + 1]
+				found = True
+				break
+
+		if not found:
+			# Guard against floating-point boundary miss by nearest-time fallback.
+			min_dist = abs(t - time_known[0])
+			min_k = 0
+			for k in range(1, T):
+				d = abs(t - time_known[k])
+				if d < min_dist:
+					min_dist = d
+					min_k = k
+			result[idx] = data[min_k]
+
+	return result
+
+
+@jit(nopython=True)
 def interpolate_time(data, time_known, time_target):
-    T = data.shape[0]
-    if time_known.shape[0] != T:
-        raise ValueError("time_known length must equal data.shape[0]")
+	"""
+	Interpolate along the leading time axis.
 
-    # 可选：严格递增性检查（如需，改为显式循环比较以适配 numba）
-    # for k in range(1, T):
-    #     if not (time_known[k] > time_known[k-1]):
-    #         raise ValueError("time_known must be strictly increasing")
-
-    spatial_shape = data.shape[1:]
-    T_target = time_target.shape[0]
-
-    out_dtype = np.float64  # 或 np.result_type(data.dtype, np.float64)（Numba 下直接写 float64 更稳）
-    result = np.empty((T_target,) + spatial_shape, dtype=out_dtype)
-
-    for idx in range(T_target):
-        t = time_target[idx]
-
-        # 处理 NaN：全部比较为 False，直接设为边界或 NaN（此处设为 NaN）
-        if not (t == t):
-            result[idx] = np.nan
-            continue
-
-        if t <= time_known[0]:
-            result[idx] = data[0]
-            continue
-        if t >= time_known[T - 1]:
-            result[idx] = data[T - 1]
-            continue
-
-        found = False
-        for j in range(T - 1):
-            if (time_known[j] <= t) and (t <= time_known[j + 1]):
-                denom = time_known[j + 1] - time_known[j]
-                if denom == 0.0:
-                    # 重复时间点：取后一帧（或取前一帧/平均，按需求定）
-                    result[idx] = data[j + 1]
-                else:
-                    w = (t - time_known[j]) / denom
-                    result[idx] = (1.0 - w) * data[j] + w * data[j + 1]
-                found = True
-                break
-
-        if not found:
-            # 若因浮点误差漏判，做一次就近钳制（也可选择报错/外推）
-            # 这里按就近点钳制
-            # 简单线性扫描求最近点
-            min_dist = abs(t - time_known[0])
-            min_k = 0
-            for k in range(1, T):
-                d = abs(t - time_known[k])
-                if d < min_dist:
-                    min_dist = d
-                    min_k = k
-            result[idx] = data[min_k]
-
-    return result
+	Notes:
+	- time_known must be one-dimensional, finite, and strictly increasing.
+	- Returns float64 output to preserve linear interpolation precision.
+	"""
+	T = data.shape[0]
+	if time_target.ndim != 1:
+		raise ValueError('time_target must be one-dimensional')
+	_validate_time_known_strictly_increasing(time_known, T)
+	return _interpolate_time_core(data, time_known, time_target)
 
 
 @jit(nopython=True, parallel=True)
@@ -96,17 +118,20 @@ def interpolate_4d_time(data, time_known, time_target):
 		- time_target: Array of target time points for interpolation, shape (T_target,).
 		
 		Returns:
-		- Interpolated four-dimensional data, shape (T_target, Z, Y, X).
+		- Interpolated four-dimensional data in float64, shape (T_target, Z, Y, X).
 	"""
 	T, Z, Y, X = data.shape
+	if time_target.ndim != 1:
+		raise ValueError('time_target must be one-dimensional')
+	_validate_time_known_strictly_increasing(time_known, T)
 	T_target = len(time_target)
 	
-	result = np.empty((T_target, Z, Y, X), dtype=data.dtype)
+	result = np.empty((T_target, Z, Y, X), dtype=np.float64)
 	
 	for z in prange(Z):  
 		for y in range(Y):
 			for x in range(X):
-				result[:, z, y, x] = interpolate_time(
+				result[:, z, y, x] = _interpolate_time_core(
 					data[:, z, y, x],
 					time_known,
 					time_target
@@ -387,6 +412,69 @@ def get_next_position_alt(lon, lat, alt_m, wind, dt, radius, lower_boundary, upp
 
 	return (new_lon, new_lat, new_alt)
 
+
+def _wind_to_state_rates(lon, lat, alt_m, wind, radius, w_positive_up=True):
+	"""Convert wind components (m/s) to state derivatives [dlon/dt, dlat/dt, dalt/dt]."""
+	lon_rad = np.deg2rad(lon)
+	lat_rad = np.deg2rad(lat)
+	if not np.isfinite(lon_rad) or not np.isfinite(lat_rad):
+		return None
+
+	radius_local = radius + alt_m
+	if not np.isfinite(radius_local) or radius_local == 0.0:
+		return None
+
+	cos_lat = np.cos(lat_rad)
+	min_abs_cos = 1e-6
+	if not np.isfinite(cos_lat):
+		return None
+	if cos_lat >= 0.0:
+		cos_lat = max(cos_lat, min_abs_cos)
+	else:
+		cos_lat = min(cos_lat, -min_abs_cos)
+
+	lon_rate = wind[0] / (radius_local * cos_lat)
+	lat_rate = wind[1] / radius_local
+	alt_rate = wind[2] if w_positive_up else -wind[2]
+
+	if (not np.isfinite(lon_rate)) or (not np.isfinite(lat_rate)) or (not np.isfinite(alt_rate)):
+		return None
+
+	return np.array([lon_rate, lat_rate, alt_rate], dtype=np.float64)
+
+
+def _advance_state_with_rates(lon, lat, alt_m, rates, dt, lower_boundary, upper_boundary, lon_mode=None):
+	"""Advance one Euler step using provided state derivatives."""
+	if not np.isfinite(dt) or dt == 0.0:
+		return (lon, lat, alt_m)
+
+	lon_rad = np.deg2rad(lon)
+	lat_rad = np.deg2rad(lat)
+	if not np.isfinite(lon_rad) or not np.isfinite(lat_rad):
+		return None
+	if rates is None or len(rates) != 3:
+		return None
+	if not (np.isfinite(rates[0]) and np.isfinite(rates[1]) and np.isfinite(rates[2])):
+		return None
+
+	new_alt = alt_m + rates[2] * dt
+	if (lower_boundary is not None and new_alt < lower_boundary) or (upper_boundary is not None and new_alt > upper_boundary):
+		return None
+
+	new_lon_rad = lon_rad + rates[0] * dt
+	new_lat_rad = lat_rad + rates[1] * dt
+	if (not np.isfinite(new_lon_rad)) or (not np.isfinite(new_lat_rad)):
+		return None
+
+	new_lat = np.rad2deg(new_lat_rad)
+	new_lon = np.rad2deg(new_lon_rad)
+	new_lat, new_lon = normalize_lat_lon(new_lat, new_lon, lon_mode)
+	if (not np.isfinite(new_lon)) or (not np.isfinite(new_lat)) or (not np.isfinite(new_alt)):
+		return None
+
+	return (new_lon, new_lat, new_alt)
+
+
 def step_implicit_midpoint_alt(lon_now, lat_now, alt_now, dt,
 				u_mid_slice, v_mid_slice, w_mid_slice,
 				alt_grid, lat_grid, lon_grid,
@@ -562,6 +650,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto'):
 	"""
 	Track particles using Heun's method with altitude (m) and vertical velocity (m/s).
+	Heun uses averaged state derivatives, not averaged wind components.
 	Particles stop when altitude crosses the provided boundaries or when any interpolated
 	wind component becomes NaN (indicating they have moved outside the data domain).
 	"""
@@ -652,9 +741,17 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				next_positions[point] = (lon_now, lat_now, alt_now)
 				continue
 
-			predicted = get_next_position_alt(
-				lon_now, lat_now, alt_now, k1_wind, dt, radius,
-				lower_boundary, upper_boundary, lon_mode=lon_mode, w_positive_up=w_positive_up
+			k1_rates = _wind_to_state_rates(
+				lon_now, lat_now, alt_now, k1_wind, radius, w_positive_up=w_positive_up
+			)
+			if k1_rates is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			predicted = _advance_state_with_rates(
+				lon_now, lat_now, alt_now, k1_rates, dt,
+				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if predicted is None:
 				active[point] = False
@@ -672,10 +769,18 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				next_positions[point] = (lon_now, lat_now, alt_now)
 				continue
 
-			final_wind = 0.5 * (k1_wind + k2_wind)
-			new_pos = get_next_position_alt(
-				lon_now, lat_now, alt_now, final_wind, dt, radius,
-				lower_boundary, upper_boundary, lon_mode=lon_mode, w_positive_up=w_positive_up
+			k2_rates = _wind_to_state_rates(
+				pred_lon, pred_lat, pred_alt, k2_wind, radius, w_positive_up=w_positive_up
+			)
+			if k2_rates is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			avg_rates = 0.5 * (k1_rates + k2_rates)
+			new_pos = _advance_state_with_rates(
+				lon_now, lat_now, alt_now, avg_rates, dt,
+				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if new_pos is None:
 				active[point] = False
@@ -695,6 +800,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 					start_index=None, start_time=None, n_steps=None):
 	"""
 	Backward Heun integration using altitude (m) and vertical velocity (m/s).
+	Heun uses averaged state derivatives, not averaged wind components.
 	Particles are traced from later to earlier times without negating the wind fields.
 	Particles stop when altitude crosses the supplied boundaries or interpolated winds are NaN.
 	"""
@@ -815,9 +921,17 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				next_positions[point] = (lon_now, lat_now, alt_now)
 				continue
 
-			predicted = get_next_position_alt(
-				lon_now, lat_now, alt_now, k1_wind, dt, radius,
-				lower_boundary, upper_boundary, lon_mode=lon_mode, w_positive_up=w_positive_up
+			k1_rates = _wind_to_state_rates(
+				lon_now, lat_now, alt_now, k1_wind, radius, w_positive_up=w_positive_up
+			)
+			if k1_rates is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			predicted = _advance_state_with_rates(
+				lon_now, lat_now, alt_now, k1_rates, dt,
+				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if predicted is None:
 				active[point] = False
@@ -835,10 +949,18 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				next_positions[point] = (lon_now, lat_now, alt_now)
 				continue
 
-			final_wind = 0.5 * (k1_wind + k2_wind)
-			new_pos = get_next_position_alt(
-				lon_now, lat_now, alt_now, final_wind, dt, radius,
-				lower_boundary, upper_boundary, lon_mode=lon_mode, w_positive_up=w_positive_up
+			k2_rates = _wind_to_state_rates(
+				pred_lon, pred_lat, pred_alt, k2_wind, radius, w_positive_up=w_positive_up
+			)
+			if k2_rates is None:
+				active[point] = False
+				next_positions[point] = (lon_now, lat_now, alt_now)
+				continue
+
+			avg_rates = 0.5 * (k1_rates + k2_rates)
+			new_pos = _advance_state_with_rates(
+				lon_now, lat_now, alt_now, avg_rates, dt,
+				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if new_pos is None:
 				active[point] = False
@@ -962,14 +1084,17 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 	return new_position_dict_list
 
 
-def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, lat_grid, lon_grid, lon_mode=None, periodic_lon='auto'):
+def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, lat_grid, lon_grid, *,
+					trace_time=None, time_grid=None, lon_mode=None, periodic_lon='auto'):
 	"""
 	Sample a time-interpolated scalar field along midpoint integration steps.
 
 	Parameters:
 	- mid_steps: list of dicts produced by track_particles_midpoint.
-	- scalar_time_interp: array with shape (T, Z, Y, X) aligned with the time grid used for midpoint tracking.
+	- scalar_time_interp: array with shape (T, Z, Y, X) aligned with `time_grid`.
 	- alt_grid_m, lat_grid, lon_grid: one-dimensional coordinate arrays for altitude (m), latitude, and longitude.
+	- trace_time: one-dimensional array of per-step sample times (length must equal len(mid_steps)).
+	- time_grid: one-dimensional strictly increasing array associated with scalar_time_interp's time axis.
 	- lon_mode: optional longitude normalization mode; inferred from lon_grid when omitted.
 	- periodic_lon: True/False/'auto' to control periodic longitude wrapping (auto detects global grids).
 
@@ -983,13 +1108,31 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 	alt_grid = np.asarray(alt_grid_m)
 	lat_grid = np.asarray(lat_grid)
 	lon_grid = np.asarray(lon_grid, dtype=np.float64)
+	if trace_time is None:
+		raise ValueError('trace_time must be provided; use get_trace_time_midpoint* to align step times')
+	if time_grid is None:
+		raise ValueError('time_grid must be provided and aligned with scalar_time_interp time axis')
+	trace_time = np.asarray(trace_time, dtype=np.float64)
+	time_grid = np.asarray(time_grid, dtype=np.float64)
 
 	if scalar_time_interp.ndim != 4:
 		raise ValueError('scalar_time_interp must be a 4D array of shape (time, altitude, latitude, longitude)')
 	if alt_grid.ndim != 1 or lat_grid.ndim != 1 or lon_grid.ndim != 1:
 		raise ValueError('alt_grid_m, lat_grid, lon_grid must be one-dimensional')
-	if scalar_time_interp.shape[0] != len(mid_steps) + 1:
-		raise ValueError('time dimension of scalar_time_interp must be len(mid_steps) + 1')
+	if trace_time.ndim != 1:
+		raise ValueError('trace_time must be one-dimensional')
+	if time_grid.ndim != 1:
+		raise ValueError('time_grid must be one-dimensional')
+	if not np.all(np.isfinite(trace_time)):
+		raise ValueError('trace_time must contain only finite values')
+	if not np.all(np.isfinite(time_grid)):
+		raise ValueError('time_grid must contain only finite values')
+	if trace_time.size != len(mid_steps):
+		raise ValueError('trace_time length must equal len(mid_steps)')
+	if scalar_time_interp.shape[0] != time_grid.size:
+		raise ValueError('time dimension mismatch between scalar_time_interp and time_grid')
+	if not np.all(np.diff(time_grid) > 0):
+		raise ValueError('time_grid must be strictly increasing')
 	if scalar_time_interp.shape[1] != alt_grid.size:
 		raise ValueError('altitude dimension mismatch between scalar_time_interp and alt_grid_m')
 	if scalar_time_interp.shape[2] != lat_grid.size or scalar_time_interp.shape[3] != lon_grid.size:
@@ -1010,13 +1153,27 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 		lon_mode = infer_lon_mode(lon_grid)
 
 	lon_ext, scalar_ext, periodic = _prepare_lon_periodic_extension(lon_grid, scalar_sorted, periodic_lon=periodic_lon)
+	time_indices = np.empty(trace_time.size, dtype=np.int64)
+	for i, t_val in enumerate(trace_time):
+		matches = np.where(np.isclose(time_grid, t_val, rtol=0.0, atol=1e-12))[0]
+		if matches.size != 1:
+			if matches.size == 0:
+				raise ValueError(
+					f'trace_time value {t_val!r} has no match in time_grid; '
+					'ensure trace_time/time_grid are generated from the same trajectory configuration'
+				)
+			raise ValueError(
+				f'trace_time value {t_val!r} matches multiple time_grid entries; '
+				'ensure time_grid values are unique and well-resolved'
+			)
+		time_indices[i] = int(matches[0])
 
 	results = []
 	for step_index, position_dict in enumerate(mid_steps):
 		if not isinstance(position_dict, dict):
 			raise ValueError('Each entry in mid_steps must be a dictionary')
 
-		field_slice = scalar_ext[step_index + 1, :, :, :]
+		field_slice = scalar_ext[time_indices[step_index], :, :, :]
 		interpolator = RegularGridInterpolator(
 			(alt_sorted, lat_grid, lon_ext),
 			field_slice,
