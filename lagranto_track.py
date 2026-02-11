@@ -645,6 +645,27 @@ def get_trace_time_heun_backward(time, start_index=None, start_time=None, n_step
 	indices = np.arange(start_idx - 1, end_idx - 1, -1, dtype=int)
 	return time[indices]
 
+
+def _initialize_particle_state_maps(need_track_initial_points, lon_mode):
+	"""
+	Initialize particle state maps keyed by stable particle indices.
+
+	Using particle_id keys preserves duplicate initial points instead of silently
+	merging them via dictionary key collisions.
+	"""
+	positions = {}
+	active = {}
+	for particle_id, point in enumerate(need_track_initial_points):
+		if len(point) != 3:
+			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
+		lon0, lat0, alt0 = point
+		if not np.isfinite(alt0):
+			raise ValueError('Initial altitude must be finite')
+		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
+		positions[particle_id] = (lon0, lat0, alt0)
+		active[particle_id] = True
+	return positions, active
+
 def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need_track_initial_points,
 				alt_grid_m, lat_grid, lon_grid, lower_boundary, upper_boundary,
 				radius=3396200, verbose=False, w_positive_up=True, lon_mode=None, periodic_lon='auto'):
@@ -653,6 +674,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 	Heun uses averaged state derivatives, not averaged wind components.
 	Particles stop when altitude crosses the provided boundaries or when any interpolated
 	wind component becomes NaN (indicating they have moved outside the data domain).
+	Each step dictionary is keyed by particle_id (input-order index).
 	"""
 	time = np.asarray(time)
 	if time.ndim != 1:
@@ -697,17 +719,7 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 	if lon_mode is None:
 		lon_mode = infer_lon_mode(lon_grid)
 
-	positions = {}
-	active = {}
-	for point in need_track_initial_points:
-		if len(point) != 3:
-			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
-		lon0, lat0, alt0 = point
-		if not np.isfinite(alt0):
-			raise ValueError('Initial altitude must be finite')
-		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
-		positions[point] = (lon0, lat0, alt0)
-		active[point] = True
+	positions, active = _initialize_particle_state_maps(need_track_initial_points, lon_mode)
 
 	new_position_dict_list = []
 	iterator = range(time.size - 1)
@@ -726,9 +738,9 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 		w_slice_next = w_sorted[itime + 1, :, :, :]
 
 		next_positions = {}
-		for point, (lon_now, lat_now, alt_now) in positions.items():
-			if not active[point]:
-				next_positions[point] = (lon_now, lat_now, alt_now)
+		for particle_id, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[particle_id]:
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k1_wind = get_interpolated_winds(
@@ -737,16 +749,16 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k1_wind)):
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k1_rates = _wind_to_state_rates(
 				lon_now, lat_now, alt_now, k1_wind, radius, w_positive_up=w_positive_up
 			)
 			if k1_rates is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			predicted = _advance_state_with_rates(
@@ -754,8 +766,8 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if predicted is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			pred_lon, pred_lat, pred_alt = predicted
@@ -765,16 +777,16 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k2_wind)):
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k2_rates = _wind_to_state_rates(
 				pred_lon, pred_lat, pred_alt, k2_wind, radius, w_positive_up=w_positive_up
 			)
 			if k2_rates is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			avg_rates = 0.5 * (k1_rates + k2_rates)
@@ -783,10 +795,10 @@ def track_particles_heun(time, u_time_interp, v_time_interp, w_time_interp, need
 				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if new_pos is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 			else:
-				next_positions[point] = new_pos
+				next_positions[particle_id] = new_pos
 
 		positions = next_positions
 		new_position_dict_list.append(next_positions)
@@ -803,6 +815,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 	Heun uses averaged state derivatives, not averaged wind components.
 	Particles are traced from later to earlier times without negating the wind fields.
 	Particles stop when altitude crosses the supplied boundaries or interpolated winds are NaN.
+	Each step dictionary is keyed by particle_id (input-order index).
 	"""
 	time = np.asarray(time)
 	if time.ndim != 1:
@@ -876,17 +889,7 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 	if start_idx == end_idx:
 		return []
 
-	positions = {}
-	active = {}
-	for point in need_track_initial_points:
-		if len(point) != 3:
-			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
-		lon0, lat0, alt0 = point
-		if not np.isfinite(alt0):
-			raise ValueError('Initial altitude must be finite')
-		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
-		positions[point] = (lon0, lat0, alt0)
-		active[point] = True
+	positions, active = _initialize_particle_state_maps(need_track_initial_points, lon_mode)
 
 	new_position_dict_list = []
 	iterator = range(start_idx, end_idx, -1)
@@ -906,9 +909,9 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 		w_slice_prev = w_sorted[itime - 1, :, :, :]
 
 		next_positions = {}
-		for point, (lon_now, lat_now, alt_now) in positions.items():
-			if not active[point]:
-				next_positions[point] = (lon_now, lat_now, alt_now)
+		for particle_id, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[particle_id]:
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k1_wind = get_interpolated_winds(
@@ -917,16 +920,16 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k1_wind)):
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k1_rates = _wind_to_state_rates(
 				lon_now, lat_now, alt_now, k1_wind, radius, w_positive_up=w_positive_up
 			)
 			if k1_rates is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			predicted = _advance_state_with_rates(
@@ -934,8 +937,8 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if predicted is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			pred_lon, pred_lat, pred_alt = predicted
@@ -945,16 +948,16 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				alt_sorted, lat_grid, lon_grid, lon_mode=lon_mode, periodic_lon=periodic_lon
 			)
 			if np.any(np.isnan(k2_wind)):
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			k2_rates = _wind_to_state_rates(
 				pred_lon, pred_lat, pred_alt, k2_wind, radius, w_positive_up=w_positive_up
 			)
 			if k2_rates is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			avg_rates = 0.5 * (k1_rates + k2_rates)
@@ -963,10 +966,10 @@ def track_particles_heun_backward(time, u_time_interp, v_time_interp, w_time_int
 				lower_boundary, upper_boundary, lon_mode=lon_mode
 			)
 			if new_pos is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 			else:
-				next_positions[point] = new_pos
+				next_positions[particle_id] = new_pos
 
 		positions = next_positions
 		new_position_dict_list.append(next_positions)
@@ -981,6 +984,7 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 	"""
 	Track particles using the implicit midpoint method with altitude (m) and vertical velocity (m/s).
 	Particles stop when altitude crosses the provided boundaries or when interpolated wind components are NaN.
+	Each step dictionary is keyed by particle_id (input-order index).
 	"""
 	time = np.asarray(time)
 	if time.ndim != 1:
@@ -1025,17 +1029,7 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 	if lon_mode is None:
 		lon_mode = infer_lon_mode(lon_grid)
 
-	positions = {}
-	active = {}
-	for point in need_track_initial_points:
-		if len(point) != 3:
-			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
-		lon0, lat0, alt0 = point
-		if not np.isfinite(alt0):
-			raise ValueError('Initial altitude must be finite')
-		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
-		positions[point] = (lon0, lat0, alt0)
-		active[point] = True
+	positions, active = _initialize_particle_state_maps(need_track_initial_points, lon_mode)
 
 	new_position_dict_list = []
 	iterator = range(time.size - 1)
@@ -1059,9 +1053,9 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 		w_mid_slice = 0.5 * (w_slice_now + w_slice_next)
 
 		next_positions = {}
-		for point, (lon_now, lat_now, alt_now) in positions.items():
-			if not active[point]:
-				next_positions[point] = (lon_now, lat_now, alt_now)
+		for particle_id, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[particle_id]:
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			new_pos = step_implicit_midpoint_alt(
@@ -1073,10 +1067,10 @@ def track_particles_midpoint(time, u_time_interp, v_time_interp, w_time_interp, 
 				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
 			)
 			if new_pos is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 			else:
-				next_positions[point] = new_pos
+				next_positions[particle_id] = new_pos
 
 		positions = next_positions
 		new_position_dict_list.append(next_positions)
@@ -1090,7 +1084,8 @@ def sample_scalar_on_midpoint_steps(mid_steps, scalar_time_interp, alt_grid_m, l
 	Sample a time-interpolated scalar field along midpoint integration steps.
 
 	Parameters:
-	- mid_steps: list of dicts produced by track_particles_midpoint.
+	- mid_steps: list of dicts produced by track_particles_midpoint or
+	  track_particles_midpoint_backward, keyed by particle_id.
 	- scalar_time_interp: array with shape (T, Z, Y, X) aligned with `time_grid`.
 	- alt_grid_m, lat_grid, lon_grid: one-dimensional coordinate arrays for altitude (m), latitude, and longitude.
 	- trace_time: one-dimensional array of per-step sample times (length must equal len(mid_steps)).
@@ -1242,6 +1237,7 @@ def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time
 	Backward implicit midpoint integration using altitude (m) and vertical velocity (m/s).
 	Particles are traced from later to earlier times without negating the wind fields.
 	Particles stop when altitude crosses the supplied boundaries or interpolated winds are NaN.
+	Each step dictionary is keyed by particle_id (input-order index).
 	"""
 	time = np.asarray(time)
 	if time.ndim != 1:
@@ -1315,17 +1311,7 @@ def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time
 	if start_idx == end_idx:
 		return []
 
-	positions = {}
-	active = {}
-	for point in need_track_initial_points:
-		if len(point) != 3:
-			raise ValueError('Each initial point must be a (lon, lat, altitude_m) tuple')
-		lon0, lat0, alt0 = point
-		if not np.isfinite(alt0):
-			raise ValueError('Initial altitude must be finite')
-		lat0, lon0 = normalize_lat_lon(lat0, lon0, lon_mode)
-		positions[point] = (lon0, lat0, alt0)
-		active[point] = True
+	positions, active = _initialize_particle_state_maps(need_track_initial_points, lon_mode)
 
 	new_position_dict_list = []
 	iterator = range(start_idx, end_idx, -1)
@@ -1350,9 +1336,9 @@ def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time
 		w_mid_slice = 0.5 * (w_slice_now + w_slice_prev)
 
 		next_positions = {}
-		for point, (lon_now, lat_now, alt_now) in positions.items():
-			if not active[point]:
-				next_positions[point] = (lon_now, lat_now, alt_now)
+		for particle_id, (lon_now, lat_now, alt_now) in positions.items():
+			if not active[particle_id]:
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 				continue
 
 			new_pos = step_implicit_midpoint_alt(
@@ -1364,10 +1350,10 @@ def track_particles_midpoint_backward(time, u_time_interp, v_time_interp, w_time
 				picard_iters=picard_iters, picard_tol=picard_tol, use_slerp_midpoint=use_slerp_midpoint
 			)
 			if new_pos is None:
-				active[point] = False
-				next_positions[point] = (lon_now, lat_now, alt_now)
+				active[particle_id] = False
+				next_positions[particle_id] = (lon_now, lat_now, alt_now)
 			else:
-				next_positions[point] = new_pos
+				next_positions[particle_id] = new_pos
 
 		positions = next_positions
 		new_position_dict_list.append(next_positions)

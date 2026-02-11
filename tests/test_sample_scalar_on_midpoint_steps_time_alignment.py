@@ -47,7 +47,7 @@ def test_forward_trace_time_alignment():
 		trace_time=trace_time, time_grid=time,
 		lon_mode='-180_180', periodic_lon=True
 	)
-	assert _sample_values(samples, start) == pytest.approx([1.0, 2.0, 3.0])
+	assert _sample_values(samples, 0) == pytest.approx([1.0, 2.0, 3.0])
 
 
 def test_backward_full_range_trace_time_alignment():
@@ -65,7 +65,7 @@ def test_backward_full_range_trace_time_alignment():
 		trace_time=trace_time, time_grid=time,
 		lon_mode='-180_180', periodic_lon=True
 	)
-	assert _sample_values(samples, start) == pytest.approx([2.0, 1.0, 0.0])
+	assert _sample_values(samples, 0) == pytest.approx([2.0, 1.0, 0.0])
 
 
 def test_backward_subset_trace_time_alignment():
@@ -83,7 +83,7 @@ def test_backward_subset_trace_time_alignment():
 		trace_time=trace_time, time_grid=time,
 		lon_mode='-180_180', periodic_lon=True
 	)
-	assert _sample_values(samples, start) == pytest.approx([3.0, 2.0])
+	assert _sample_values(samples, 0) == pytest.approx([3.0, 2.0])
 
 
 def test_missing_trace_time_raises():
@@ -124,4 +124,3 @@ def test_trace_time_value_without_match_raises():
 			[{}], scalar, alt, lat, lon,
 			trace_time=np.array([5.0], dtype=np.float64), time_grid=time
 		)
-
